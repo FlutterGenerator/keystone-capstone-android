@@ -1,0 +1,224 @@
+name: Rebuild Capstone/Keystone (PIC)
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+
+env:
+  NDK_VERSION: "23.1.7779620"
+  ANDROID_PLATFORM: "android-21"
+  CAPSTONE_TAG: "6.0.0-Alpha9"
+  KEYSTONE_TAG: "0.9.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Android NDK ${{ env.NDK_VERSION }}
+        run: |
+          echo "y" | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
+          echo "NDK=${ANDROID_HOME}/ndk/${{ env.NDK_VERSION }}" >> "$GITHUB_ENV"
+
+      - name: Install CMake
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      # ----------------------------------------------------------
+      # CAPSTONE — собираем static lib с -fPIC под текущий ABI матрицы
+      # ----------------------------------------------------------
+      - name: Clone Capstone
+        run: git clone --depth 1 --branch ${{ env.CAPSTONE_TAG }} https://github.com/capstone-engine/capstone.git
+
+      - name: Build Capstone (${{ matrix.abi }})
+        run: |
+          cmake -S capstone -B capstone/build-${{ matrix.abi }} -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=${{ env.ANDROID_PLATFORM }} \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCAPSTONE_BUILD_SHARED_LIBS=OFF \
+            -DCAPSTONE_BUILD_STATIC_LIBS=ON \
+            -DCAPSTONE_BUILD_TESTS=OFF \
+            -DCAPSTONE_BUILD_CSTOOL=OFF
+          cmake --build capstone/build-${{ matrix.abi }} -j$(nproc)
+          find capstone/build-${{ matrix.abi }} -name "libcapstone.a"
+
+      # ----------------------------------------------------------
+      # KEYSTONE — собираем static lib с -fPIC под текущий ABI матрицы
+      # ----------------------------------------------------------
+      - name: Clone Keystone
+        run: git clone --depth 1 --branch ${{ env.KEYSTONE_TAG }} https://github.com/keystone-engine/keystone.git
+
+      - name: Build Keystone (${{ matrix.abi }})
+        run: |
+          cmake -S keystone -B keystone/build-${{ matrix.abi }} -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=${{ env.ANDROID_PLATFORM }} \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_LIBS_ONLY=1
+          cmake --build keystone/build-${{ matrix.abi }} -j$(nproc)
+          find keystone/build-${{ matrix.abi }} -name "libkeystone.a"
+
+      # ----------------------------------------------------------
+      # Копируем готовые .a в проект, перезаписывая старые
+      # ----------------------------------------------------------
+      - name: Replace prebuilt libs with PIC-built ones
+        run: |
+          set -e
+          DEST=app/src/main/jni/prebuilt/libs/${{ matrix.abi }}
+
+          mkdir -p "$DEST"
+
+          CS_LIB=$(find capstone/build-${{ matrix.abi }} -name "libcapstone.a" | head -n1)
+          KS_LIB=$(find keystone/build-${{ matrix.abi }} -name "libkeystone.a" | head -n1)
+
+          for f in "$CS_LIB" "$KS_LIB"; do
+            if [ -z "$f" ] || [ ! -f "$f" ]; then
+              echo "ERROR: expected built library not found (got: '$f')"
+              exit 1
+            fi
+          done
+
+          cp "$CS_LIB" "$DEST/libcapstone.a"
+          cp "$KS_LIB" "$DEST/libkeystone.a"
+
+          echo "--- Replaced .a files for ${{ matrix.abi }} ---"
+          ls -la "$DEST"
+
+      # ----------------------------------------------------------
+      # Обновляем заголовки Capstone и Keystone (один раз достаточно,
+      # заголовки не зависят от ABI — делаем это на каждом прогоне
+      # матрицы, но результат идентичен; кладём в общий путь проекта).
+      # ----------------------------------------------------------
+      - name: Update Capstone headers to match rebuilt library version
+        run: |
+          set -e
+          INCLUDE_DEST=app/src/main/jni/prebuilt/include/capstone
+
+          rm -rf "$INCLUDE_DEST"
+          mkdir -p "$INCLUDE_DEST"
+          cp -r capstone/include/capstone/. "$INCLUDE_DEST/"
+
+          echo "--- Updated capstone headers ---"
+          grep -i "CS_API_MAJOR" "$INCLUDE_DEST/capstone.h"
+          ls -la "$INCLUDE_DEST"
+
+      - name: Update Keystone headers to match rebuilt library version
+        run: |
+          set -e
+          INCLUDE_DEST=app/src/main/jni/prebuilt/include/Keystone
+
+          rm -rf "$INCLUDE_DEST"
+          mkdir -p "$INCLUDE_DEST"
+          cp -r keystone/include/keystone/. "$INCLUDE_DEST/"
+
+          echo "--- Updated keystone headers ---"
+          grep -i "KS_API_MAJOR\|KS_API_MINOR\|KS_VERSION_EXTRA" "$INCLUDE_DEST/keystone.h"
+          ls -la "$INCLUDE_DEST"
+
+      - name: Stage artifact layout for this ABI
+        run: |
+          set -e
+          STAGE=staging
+          mkdir -p "$STAGE/libs/${{ matrix.abi }}"
+          cp app/src/main/jni/prebuilt/libs/${{ matrix.abi }}/libcapstone.a "$STAGE/libs/${{ matrix.abi }}/libcapstone.a"
+          cp app/src/main/jni/prebuilt/libs/${{ matrix.abi }}/libkeystone.a "$STAGE/libs/${{ matrix.abi }}/libkeystone.a"
+          mkdir -p "$STAGE/include"
+          cp -r app/src/main/jni/prebuilt/include/capstone "$STAGE/include/capstone"
+          cp -r app/src/main/jni/prebuilt/include/Keystone "$STAGE/include/Keystone"
+
+      - name: Upload rebuilt static libs + headers (${{ matrix.abi }})
+        uses: actions/upload-artifact@v7
+        with:
+          name: keystone-capstone-android-${{ matrix.abi }}-${{ github.run_id }}
+          path: staging/
+
+  merge-artifacts:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # ------------------------------------------------------------
+      # Скачиваем каждый ABI-артефакт В СВОЮ папку (без слияния),
+      # чтобы можно было упаковать их в отдельные zip-файлы.
+      # ------------------------------------------------------------
+      - name: Download per-ABI artifacts (separate folders)
+        uses: actions/download-artifact@v7
+        with:
+          pattern: keystone-capstone-android-*-${{ github.run_id }}
+          path: per-abi
+
+      - name: Zip each ABI separately
+        run: |
+          set -e
+          mkdir -p release-files
+          SUFFIX="-${{ github.run_id }}"
+          for dir in per-abi/*/; do
+            name=$(basename "$dir")
+            name=${name%/}
+            # убираем префикс "keystone-capstone-android-" и суффикс "-<run_id>"
+            abi=${name#keystone-capstone-android-}
+            abi=${abi%"$SUFFIX"}
+            echo "Folder: $name -> ABI: $abi"
+            (cd "$dir" && zip -r "../../release-files/keystone-capstone-android-${abi}.zip" .)
+          done
+          ls -la release-files
+
+      # ------------------------------------------------------------
+      # Дополнительно собираем один общий zip со всеми ABI вместе
+      # ------------------------------------------------------------
+      - name: Download all per-ABI artifacts (merged)
+        uses: actions/download-artifact@v7
+        with:
+          pattern: keystone-capstone-android-*-${{ github.run_id }}
+          path: merged
+          merge-multiple: true
+
+      - name: Upload single merged artifact (all ABIs)
+        uses: actions/upload-artifact@v7
+        with:
+          name: keystone-capstone-android-${{ github.run_id }}
+          path: merged/
+
+      - name: Zip merged libs (all ABIs combined)
+        run: |
+          cd merged
+          zip -r ../release-files/keystone-capstone-android-all.zip .
+          cd ..
+          ls -la release-files
+
+      - name: Publish GitHub Release with rebuilt libs (combined + per-ABI)
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: keystone-capstone-android-${{ github.run_id }}
+          name: "Capstone ${{ env.CAPSTONE_TAG }} / Keystone ${{ env.KEYSTONE_TAG }} (PIC, all ABIs)"
+          body: |
+            Автоматически пересобранные статические библиотеки Capstone и Keystone
+            с включённым -fPIC под все 4 ABI (arm64-v8a, armeabi-v7a, x86, x86_64).
+
+            - Capstone: ${{ env.CAPSTONE_TAG }}
+            - Keystone: ${{ env.KEYSTONE_TAG }}
+            - NDK: ${{ env.NDK_VERSION }}
+            - Android Platform: ${{ env.ANDROID_PLATFORM }}
+
+            Файлы:
+            - `keystone-capstone-android-all.zip` — все 4 ABI вместе
+            - `keystone-capstone-android-arm64-v8a.zip` — только arm64-v8a
+            - `keystone-capstone-android-armeabi-v7a.zip` — только armeabi-v7a
+            - `keystone-capstone-android-x86.zip` — только x86
+            - `keystone-capstone-android-x86_64.zip` — только x86_64
+          generate_release_notes: false
+          prerelease: false
+          files: release-files/*.zip
