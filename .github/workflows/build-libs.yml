@@ -8,7 +8,7 @@ on:
 
 env:
   NDK_VERSION: "23.1.7779620"
-  ANDROID_PLATFORM: "android-21"
+  ANDROID_PLATFORM: "android-19"
   CAPSTONE_TAG: "6.0.0-Alpha9"
   KEYSTONE_TAG: "0.9.2"
 
